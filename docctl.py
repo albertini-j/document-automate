@@ -10,6 +10,8 @@ Assumptions and safe defaults:
 - document_list.xlsx always reflects the latest accepted transmittal for each DOCUMENT NUMBER 1 (chronological override, no version sequencing logic).
 - Versions already present in transmittal_database.xlsx for a DOCUMENT NUMBER 1 cannot be resubmitted; such transmittals are rejected.
 - If destination folders already contain a transmittal with the same name, a numeric suffix (-1, -2, ...) is added to avoid overwriting.
+- The Current Files directory is synced to the latest accepted transmittal by deleting older matching files and copying in the newly accepted files.
+- All rows within a transmittal are validated to aggregate every error before deciding acceptance; remaining pending transmittals continue processing even after encountering errors.
 """
 from __future__ import annotations
 
@@ -199,6 +201,32 @@ def move_transmittal(src: Path, dest_root: Path) -> Path:
     return candidate
 
 
+def sync_current_files(current_dir: Path, transmittal_dir: Path, rows: List[TransmittalRow], logger: logging.Logger) -> None:
+    current_dir.mkdir(parents=True, exist_ok=True)
+
+    processed_docs: set[str] = set()
+    for row in rows:
+        doc_key = row.normalized_doc
+        if doc_key not in processed_docs:
+            for existing in current_dir.iterdir():
+                if existing.is_file() and doc_key in existing.name.lower():
+                    try:
+                        existing.unlink()
+                        logger.info("Removed outdated current file %s for document %s", existing.name, row.raw["DOCUMENT NUMBER 1"])
+                    except Exception as exc:  # pragma: no cover - defensive logging only
+                        logger.warning("Failed to remove %s: %s", existing, exc)
+            processed_docs.add(doc_key)
+
+        for fname in row.filenames:
+            src = transmittal_dir / fname
+            if not src.exists():
+                logger.warning("Listed file %s missing in transmittal %s", fname, transmittal_dir.name)
+                continue
+            dest = current_dir / fname
+            shutil.copy2(src, dest)
+            logger.info("Copied %s to Current Files for document %s", fname, row.raw["DOCUMENT NUMBER 1"])
+
+
 def process_transmittal(transmittal_dir: Path, project_paths: Dict[str, Path], logger: logging.Logger) -> None:
     log_file = transmittal_dir / f"{transmittal_dir.name}.xlsx"
     if not log_file.exists():
@@ -213,30 +241,41 @@ def process_transmittal(transmittal_dir: Path, project_paths: Dict[str, Path], l
         sheet = workbook.active
         raw_rows = read_sheet_rows(sheet)
         processed_rows: List[TransmittalRow] = []
-        for raw in raw_rows:
-            for field in REQUIRED_FIELDS:
-                value = raw.get(field)
-                if value is None or str(value).strip() == "":
-                    raise ValueError(f"Required field '{field}' is empty")
-            normalized_doc = normalize_doc_number(raw["DOCUMENT NUMBER 1"])
-            normalized_version = normalize_version(raw["VERSION"])
-            version_key = (normalized_doc, normalized_version.lower())
-            if version_key in existing_versions:
-                raise ValueError(
-                    f"Duplicate version '{raw['VERSION']}' for document '{raw['DOCUMENT NUMBER 1']}' already submitted"
+        errors: List[str] = []
+        for idx, raw in enumerate(raw_rows, start=2):
+            try:
+                for field in REQUIRED_FIELDS:
+                    value = raw.get(field)
+                    if value is None or str(value).strip() == "":
+                        raise ValueError(f"Required field '{field}' is empty")
+                normalized_doc = normalize_doc_number(raw["DOCUMENT NUMBER 1"])
+                normalized_version = normalize_version(raw["VERSION"])
+                version_key = (normalized_doc, normalized_version.lower())
+                if version_key in existing_versions:
+                    raise ValueError(
+                        f"Duplicate version '{raw['VERSION']}' for document '{raw['DOCUMENT NUMBER 1']}' already submitted"
+                    )
+                raw["DATE"] = coerce_date(raw["DATE"])
+                filenames = find_matching_files(transmittal_dir, normalized_doc, log_file)
+                processed_rows.append(
+                    TransmittalRow(
+                        raw=raw,
+                        normalized_doc=normalized_doc,
+                        normalized_version=normalized_version,
+                        filenames=filenames,
+                    )
                 )
-            raw["DATE"] = coerce_date(raw["DATE"])
-            filenames = find_matching_files(transmittal_dir, normalized_doc, log_file)
-            processed_rows.append(
-                TransmittalRow(
-                    raw=raw,
-                    normalized_doc=normalized_doc,
-                    normalized_version=normalized_version,
-                    filenames=filenames,
-                )
-            )
+            except Exception as exc:  # pragma: no cover - defensive aggregation for reporting
+                errors.append(f"Row {idx}: {exc}")
+                continue
+
+        if errors:
+            for msg in errors:
+                logger.error("Transmittal %s validation error - %s", transmittal_dir.name, msg)
         if not processed_rows:
-            raise ValueError("Transmittal contains no rows")
+            raise ValueError("Transmittal contains no valid rows")
+        if errors:
+            raise ValueError("Transmittal rejected due to validation errors")
     except Exception as exc:
         logger.exception("Transmittal %s rejected: %s", transmittal_dir.name, exc)
         move_transmittal(transmittal_dir, project_paths["rejected"])
@@ -244,6 +283,7 @@ def process_transmittal(transmittal_dir: Path, project_paths: Dict[str, Path], l
 
     append_to_database(project_paths["database"], processed_rows)
     update_document_list(project_paths["doc_list"], processed_rows)
+    sync_current_files(project_paths["current"], transmittal_dir, processed_rows, logger)
     moved_path = move_transmittal(transmittal_dir, project_paths["accepted"])
     logger.info("Transmittal %s accepted and moved to %s", transmittal_dir.name, moved_path)
 
