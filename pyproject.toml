@@ -1,0 +1,20 @@
+[project]
+name = "document-automate"
+version = "0.1.0"
+description = "Automated document control workflow for engineering design projects"
+authors = [{ name = "Auto Generated" }]
+requires-python = ">=3.11"
+dependencies = [
+    "openpyxl",
+    "python-dateutil",
+]
+
+[project.scripts]
+docctl = "docctl:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+package = true
