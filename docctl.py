@@ -9,9 +9,13 @@ Assumptions and safe defaults:
 - Document-to-file association uses case-insensitive substring matching on DOCUMENT NUMBER 1 within filenames (excluding the transmittal log itself).
 - document_list.xlsx always reflects the latest accepted transmittal for each DOCUMENT NUMBER 1 (chronological override, no version sequencing logic).
 - Versions already present in transmittal_database.xlsx for a DOCUMENT NUMBER 1 cannot be resubmitted; such transmittals are rejected.
+- DATE stored in reports reflects the analysis/approval timestamp (current runtime), overriding the DATE provided in the transmittal log after validation.
 - If destination folders already contain a transmittal with the same name, a numeric suffix (-1, -2, ...) is added to avoid overwriting.
 - The Current Files directory is synced to the latest accepted transmittal by deleting older matching files and copying in the newly accepted files.
 - All rows within a transmittal are validated to aggregate every error before deciding acceptance; remaining pending transmittals continue processing even after encountering errors.
+- Any files present in a transmittal folder that are not listed in the transmittal log will cause the transmittal to be rejected.
+- Command-line supports selecting specific transmittals by folder name with --transmittal; use --all or omit --transmittal to
+  process everything pending.
 """
 from __future__ import annotations
 
@@ -235,6 +239,7 @@ def process_transmittal(transmittal_dir: Path, project_paths: Dict[str, Path], l
         return
 
     existing_versions = load_existing_versions(project_paths["database"])
+    actual_files = [entry.name for entry in transmittal_dir.iterdir() if entry.is_file() and entry != log_file]
 
     try:
         workbook = load_workbook(log_file)
@@ -269,6 +274,13 @@ def process_transmittal(transmittal_dir: Path, project_paths: Dict[str, Path], l
                 errors.append(f"Row {idx}: {exc}")
                 continue
 
+        matched_files = {fname for row in processed_rows for fname in row.filenames}
+        unmatched_files = [fname for fname in actual_files if fname not in matched_files]
+        if unmatched_files:
+            errors.append(
+                "Unlisted files in transmittal folder: " + ", ".join(sorted(unmatched_files))
+            )
+
         if errors:
             for msg in errors:
                 logger.error("Transmittal %s validation error - %s", transmittal_dir.name, msg)
@@ -280,6 +292,10 @@ def process_transmittal(transmittal_dir: Path, project_paths: Dict[str, Path], l
         logger.exception("Transmittal %s rejected: %s", transmittal_dir.name, exc)
         move_transmittal(transmittal_dir, project_paths["rejected"])
         return
+
+    approved_at = datetime.now()
+    for row in processed_rows:
+        row.raw["DATE"] = approved_at
 
     append_to_database(project_paths["database"], processed_rows)
     update_document_list(project_paths["doc_list"], processed_rows)
@@ -322,12 +338,29 @@ def ensure_project_paths(root: Path) -> Dict[str, Path]:
     return paths
 
 
-def process_project(root: Path) -> None:
+def process_project(root: Path, selected_transmittals: List[str] | None = None, process_all: bool = False) -> None:
     project_paths = ensure_project_paths(root)
     logger = configure_logging(project_paths["logs"])
 
     pending_dir = project_paths["pending"]
-    transmittals = [p for p in pending_dir.iterdir() if p.is_dir()]
+    all_transmittals = [p for p in pending_dir.iterdir() if p.is_dir()]
+    name_map = {p.name: p for p in all_transmittals}
+
+    transmittals: List[Path]
+    if selected_transmittals:
+        missing: List[str] = []
+        transmittals = []
+        for name in selected_transmittals:
+            match = name_map.get(name)
+            if match:
+                transmittals.append(match)
+            else:
+                missing.append(name)
+        for name in missing:
+            logger.error("Transmittal %s not found in %s", name, pending_dir)
+    elif process_all or not selected_transmittals:
+        transmittals = all_transmittals
+
     if not transmittals:
         logger.info("No pending transmittals found in %s", pending_dir)
         return
@@ -345,12 +378,27 @@ def parse_args() -> argparse.Namespace:
         default=Path.cwd(),
         help="Root directory of the project containing the required subfolders.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "-t",
+        "--transmittal",
+        action="append",
+        help="Pending transmittal folder name to process (can be provided multiple times).",
+    )
+    parser.add_argument(
+        "--all",
+        dest="process_all",
+        action="store_true",
+        help="Process all pending transmittals (default when --transmittal is not provided).",
+    )
+    args = parser.parse_args()
+    if args.transmittal and args.process_all:
+        parser.error("--transmittal cannot be used with --all")
+    return args
 
 
 def main() -> None:
     args = parse_args()
-    process_project(args.project_root)
+    process_project(args.project_root, args.transmittal, args.process_all)
 
 
 if __name__ == "__main__":
